@@ -1,0 +1,654 @@
+import json
+import math
+import pickle
+import sys
+import uuid
+from collections import defaultdict
+
+import click
+import numpy as np
+import remoter
+from bokeh.io import show
+from bokeh.layouts import column, grid, row
+from bokeh.models import ColumnDataSource, CustomJS, Div, Label, Panel, Tabs, TapTool
+from bokeh.palettes import Category10, Turbo256, viridis, inferno, plasma
+from bokeh.plotting import figure
+from bokeh.transform import linear_cmap
+from bokeh.document import Document
+from remoter import Server, load, save, Scheduler
+from syn_bokeh_helpers import embed_callback, rows_to_columns, syn_save
+from synot.datasources import LT48NewFormat
+from synot.helpers import violin
+from synot.ot import no_kde_algorithm, no_kde_cost, normalize_libs, plot_foldchange, plot_foldchange_no_kde, regularize, plot_foldchange_no_kde_smooth, smooth_lowess, weighted_kde, smooth_gaussian
+
+from tqdm import tqdm
+
+from bokeh.document import Document
+import bokeh.settings
+import time
+import socket
+
+from bokeh.util.serialization import make_globally_unique_id
+
+import config134
+
+bokeh.settings.settings.simple_ids = False
+
+class Item:
+    def __init__(self, a):
+        self.result = a
+
+
+def save_plot(p):
+    d = Document()
+    d.add_root(p)
+    return d.to_json()
+
+def load_plot(j):
+    ids = {}
+    d = Document.from_json(j)
+    p = d.roots[0]
+
+    if p._id not in ids:
+        ids[p._id] = make_globally_unique_id()
+    p._id = ids[p._id]
+
+    for ref in p.references():
+        if ref._id not in ids:
+            ids[ref._id] = make_globally_unique_id()
+        ref._id = ids[ref._id]
+        ref._document = None
+    p._document = None
+    return p
+
+
+lt48 = LT48NewFormat(config134.lt48path)
+lt48.load()
+
+palette = viridis(43)[::-1]
+
+data Result(x, tx, dens, prefix1, prefix2, day, r1, r2, l1, l2, stddev)
+
+def replace(d, **kwargs):
+    di = d._asdict()
+    di.update(kwargs)
+    return type(d)(**di)
+
+def norm_dens(l):
+    min_dens, max_dens = get_range_per_replicate(.dens, l)
+    results = []
+    for r in l:
+        results.append(replace(r, dens=r.dens / max_dens))
+    return results
+
+
+def flatten_all(l):
+    if isinstance(l, dict):
+        for ll in l.values():
+            yield from flatten_all(ll)
+    elif isinstance(l, list):
+        for ll in l:
+            yield from flatten_all(ll)
+    else:
+        yield l
+
+def get_range_per_replicate(f, l):
+    m, mm = np.inf, -np.inf
+    for r in flatten_all(l):
+        y = f(r)
+        ym = np.min(y)
+        ymm = np.max(y)
+        if ym < m:
+            m = ym
+        if ymm > mm:
+            mm = ymm
+    return m, mm
+
+def save_figure(p):
+    doc = Document()
+    doc.add_root(p)
+    j = doc.to_json()
+    return j
+
+def load_figure(j):
+    doc = Document.from_json(j)
+    p = doc.roots[0]
+    p._document = None
+    for ref in p.references():
+        ref._document = None
+    return p
+
+def get_lib_names(prefix):
+    if prefix.startswith("PURO"):
+        return "susceptible", "resistant"
+    elif prefix.startswith("KO"):
+        return "wt", "ko"
+    else:
+        return "lib1", "lib2"
+
+def group_by(f, l):
+    d = {}
+    for x in l:
+        k = f(x)
+        if not k in d:
+            d[k] = []
+        d[k].append(x)
+    return d
+
+
+def get_for_prefix(prefix, rpm=False, th=0.99):
+    prefix_a, prefix_b = prefix
+    prefix1, p1l = prefix_a
+    prefix2, p2l = prefix_b
+    #p1l1, p1l2 = get_lib_names(prefix1)
+    #p2l1, p2l2 = get_lib_names(prefix2)
+    lt48.rpm = rpm
+    data1 = lt48.get_data(prefix1, cells=False, replicates_seperate=True)
+    data2 = lt48.get_data(prefix2, cells=False, replicates_seperate=True)
+
+    days = sorted(list(set(data1.keys())))
+    r = []
+
+    for day in days:
+        color = palette[int(day)]
+        replicates1 = data1[day].keys()
+        replicates2 = data2[day].keys()
+
+        for r1 in replicates1:
+            for r2 in replicates2:
+
+                try:
+                    d1, d2 = data1[day][r1][p1l], data2[day][r2][p2l]
+                except:
+                    print(f"Error in {prefix1} R {r1} {p1l} / {prefix2} R {r2} {p2l} Day {day}")
+                    continue
+                if len(d1) == 0 or len(d2) == 0:
+                    print(f"length is not enough, skipping {prefix1} R {r1} / {prefix2} R {r2} Day {day}")
+                    continue
+                d1, d2 = np.sort(d1), np.sort(d2)
+                dr1, dr2 = regularize(d1, d2)
+                x, tx, dens = no_kde_algorithm(dr1, dr2)
+
+                tx = np.log2(tx)
+                tx = tx - tx[0]
+
+                dens = dens / np.max(dens)
+                x, tx, dens = filter_low_dens(x, tx, dens, th)
+                r.append(Result(x, tx, dens, prefix1, prefix2, day, r1, r2, p1l, p2l, None))
+    return r
+
+def get_data_per_replicate_no_norm(prefixes, rpm=False, th=0.99):
+    rs = [(prefix, get_for_prefix(prefix, rpm=rpm, th=th)) for prefix in prefixes]
+    return rs
+
+@load(load_plot)
+@save(save_plot)
+def generate_p(prefix, day_colors, r_colors, xm, xmm, ym, ymm, cumulative=False, log10=True, rpm=True, th=1.01):
+    prefix_a, prefix_b = prefix
+    prefix1, l1 = prefix_a
+    prefix2, l2 = prefix_b
+    p = None
+    l = get_data_per_replicate_no_norm([prefix], rpm=rpm, th=th)[0][1]
+
+    if cumulative:
+        if log10:
+            x_axis_label = "Cumulative Organoid % [log10]"
+        else:
+            x_axis_label = "Cumulative Organoid %"
+    else:
+        if log10:
+            x_axis_label = "Lineage Size [Reads log10]"
+        else:
+            x_axis_label = "Lineage Size [Reads]"
+
+    if cumulative:
+        l = fmap(make_cumulative, l)
+    if log10 and not cumulative:
+        l = [replace(r, x=r.x |>  np.log10) for r in l]
+    if log10 and cumulative:
+        l = [replace(r, x=r.x |> np.log10) for r in l]
+
+    for r in l:
+
+        p = plot_foldchange_no_kde(r.x,
+            r.tx,
+            r.dens,
+            frame_height=150,
+            frame_width=400,
+            color=day_colors[r.day],
+            p=p,
+            title=f"{prefix2} {l2} / {prefix1} {l1}",
+            x_range=(xm, xmm),
+            y_range=(ym, ymm),
+            toolbar_location=None,
+            x_axis_label=x_axis_label,
+            y_axis_label="Foldchange (log2)",
+            )
+
+
+        #p = plot_foldchange_no_kde_smooth(r.x,
+            #r.tx,
+            #r.dens,
+            #frame_height=150,
+            #frame_width=400,
+            #color=day_colors[r.day],
+            #p=p,
+            #title=f"{prefix2} {l2} / {prefix1} {l1}",
+            #x_range=(xm, xmm),
+            #y_range=(ym, ymm),
+            #toolbar_location=None,
+            #x_axis_label=x_axis_label,
+            #y_axis_label="Lineage Size (log2)",
+            #width=0.3,
+            #line_color=r_colors[r.r1],
+            #line=True)
+
+    theme(p)
+    return p
+
+def generate_p_dots(prefix, l, day_colors, r_colors, xm, xmm, ym, ymm, p=None, cumulative=False, log10=False):
+    prefix_a, prefix_b = prefix
+    prefix1, l1 = prefix_a
+    prefix2, l2 = prefix_b
+    for r in l:
+        if cumulative:
+
+            x = r.x |> np.cumsum |> x -> x / x[-1] # |> np.log10
+            if log10:
+                x = np.log10(x)
+                xm = -5
+                xmm = 0
+            else:
+                xm = 0
+                xmm = 1
+        else:
+            x = r.x
+
+        x_axis_label = "Lineage Size [Reads Log2]"
+        if cumulative:
+            x_axis_label = "Cumulative Organoid %"
+            if log10:
+                x_axis_label = "Cumulative Organoid % [log10]"
+        p = plot_foldchange_no_kde(x,
+            r.tx,
+            r.dens,
+            frame_height=150,
+            frame_width=400,
+            color=day_colors[r.day],
+            p=p,
+            title=f"{prefix2} {l2} / {prefix1} {l1}",
+            x_range=(xm, xmm),
+            y_range=(ym, ymm),
+            toolbar_location=None,
+            x_axis_label=x_axis_label,
+            y_axis_label="Foldchange (log2)",
+            )
+
+        theme(p)
+    return p
+
+
+@load(load_plot)
+@save(save_plot)
+def generate_p_averaged(prefix, day_colors, r_colors, xm, xmm, ym, ymm, p=None, cumulative=False, log10=False, rpm=False, th=0.99, show_std=True, dens_factor=10):
+
+    prefix_a, prefix_b = prefix
+    prefix1, l1 = prefix_a
+    prefix2, l2 = prefix_b
+
+    print("generate_p_averaged", prefix_a, prefix_b)
+    l = get_data_per_replicate_no_norm([prefix], rpm=rpm, th=th)[0][1]
+
+    per_day: dict[day: list[Result]] = group_by(.day, l)
+
+    def make_cumulative(r: Result):
+        x = r.x
+        idx = np.argsort(x)
+        x = x[idx]
+        tx = r.tx[idx]
+        dens = r.dens[idx]
+
+        x = np.cumsum(x)
+        x = x / np.max(x)
+
+        r = replace(r, x=x, tx=tx, dens=dens)
+        return r
+
+    def smooth_result(newx, r: Result):
+        #newy = smooth_gaussian(r.tx, r.x, newx, scale=10)
+        newy = smooth_lowess(r.tx, r.x, newx)
+        newy = newy - newy[0]
+        new_dens = weighted_kde(r.x, r.dens, newx, wh=2*len(r.x), scale=0.01)
+        new_dens = new_dens / np.sum(new_dens)
+        return Result(newx, newy, new_dens ,r.prefix1, r.prefix2, r.day, r.r1, r.r2, r.l1, r.l2, None)
+
+    def combine_results(a: Result, b: Result):
+        x, tx, dens = fmap(z-> np.concatenate(z), [(a.x, b.x), (a.tx, b.tx), (a.dens, b.dens)])
+        return Result(x, tx, dens, a.prefix1, a.prefix2, None, None, None, a.l1, a.l2, None)
+
+    def average_results(rs):
+        x = np.mean([r.x for r in rs], axis=0)
+        tx = np.mean([r.tx for r in rs], axis=0)
+        #tx = tx - tx[0]
+        dens = np.mean([r.dens for r in rs], axis=0)
+        dens = dens / np.sum(dens)
+        stddev = np.std([r.tx for r in rs], axis=0)
+        return replace(rs[0], x=x, tx=tx, dens=dens, stddev=stddev)
+
+    for day, l in per_day.items():
+        if day == "00":
+            continue
+
+        if cumulative:
+            l = fmap(make_cumulative, l)
+
+        if log10 and not cumulative:
+            l = [replace(r, x=r.x |>  np.log10) for r in l]
+        if log10 and cumulative:
+            l = [replace(r, x=r.x |> np.log10) for r in l]
+
+        oxm, oxmm = get_range_per_replicate(.x, l)
+        newx = np.linspace(oxm, oxmm, 200)
+
+        l = fmap(smooth_result$(newx), l)
+        r = average_results(l)
+
+        #idx = np.argsort(r.x)
+        #x = r.x[idx]
+        #tx = r.tx[idx]
+        #stddev = r.stddev[idx]
+        #dens = r.dens[idx]
+        x = r.x
+        tx = r.tx
+        dens = r.dens
+        dens = dens / np.sum(dens)
+        stddev = r.stddev
+
+        cumdens = np.cumsum(dens)
+        median_x = x[np.searchsorted(cumdens, 0.5)]
+
+        #tx = tx-tx[0]
+        dens  = dens * (ymm-ym)*dens_factor
+
+        if cumulative:
+            if log10:
+                x_axis_label = "Cumulative Organoid % [log10]"
+            else:
+                x_axis_label = "Cumulative Organoid %"
+        else:
+            if log10:
+                x_axis_label = "Lineage Size [Reads log10]"
+            else:
+                x_axis_label = "Lineage Size [Reads]"
+
+        if show_std:
+            area = stddev
+        else:
+            area = dens
+
+        p = plot_foldchange_no_kde_smooth(x,
+            tx,
+            area,
+            frame_height=120,
+            frame_width=300,
+            color=day_colors[day],
+            p=p,
+            title=f"{prefix2} {r.l2} / {prefix1} {r.l1}",
+            x_range=(xm, xmm),
+            y_range=(ym, ymm),
+            toolbar_location=None,
+            x_axis_label=x_axis_label,
+            y_axis_label="Foldchange (log2)",
+            width=0.3,
+            scale=10,
+            line_color=None,
+            median_x=median_x,
+            line=True)
+
+        theme(p)
+    p.line(x=[xm, xmm], y=[0, 0], color="black", line_width=0.66 )
+
+    #syn_save(p, f"svgs/cumulative_{prefix}.svg", "svg")
+    return p
+
+
+def theme(p):
+    p.xgrid.visible = False
+    p.ygrid.visible = False
+    p.xaxis.major_label_standoff = 1
+    p.xaxis.axis_label_standoff = 1
+    p.yaxis.major_label_standoff = 1
+    p.yaxis.axis_label_standoff = 1
+    p.xaxis.major_label_text_font = "helvetica"
+    p.yaxis.major_label_text_font = "helvetica"
+    p.xaxis.axis_label_text_font = "helvetica"
+    p.yaxis.axis_label_text_font = "helvetica"
+    p.yaxis.axis_label_text_font_style = "normal"
+    p.xaxis.axis_label_text_font_style = "normal"
+
+    p.legend.label_text_font = "helvetica"
+    p.xaxis.major_label_text_font_size = "5pt"
+    p.yaxis.major_label_text_font_size = "5pt"
+    p.xaxis.axis_label_text_font_size = "5pt"
+    p.yaxis.axis_label_text_font_size = "5pt"
+    p.legend.label_text_font_size = "5pt"
+    p.title.text_font = "helvetica"
+    p.title.text_font_size = "8pt"
+    p.title.text_font_style="normal"
+
+
+def filter_low_dens(x, tx, dens, th=0.99):
+
+    dens = dens / np.max(dens)
+
+    th = int(len(dens)*th)
+
+    x, tx, dens = [x, tx, dens] |> fmap$(.[:th])
+
+    #mask = dens < 0.01
+    #x, tx, dens = [x, tx, dens] |> map$(.[mask])
+
+    return x, tx, dens
+
+
+def get_x_bound(prefix, rpm, threshold):
+    results = (get_data_per_replicate_no_norm([prefix], rpm=rpm, th=threshold))[0][1]
+    xm, xmm = get_range_per_replicate(.x , results)
+    return xm, xmm
+
+
+def get_y_bound(prefix, rpm, threshold):
+    results = (get_data_per_replicate_no_norm([prefix], rpm=rpm, th=threshold))[0][1]
+    txm, txmm = get_range_per_replicate(.tx , results)
+    return txm, txmm
+
+
+def get_replicates(prefix, rpm, threshold):
+    results = (get_data_per_replicate_no_norm([prefix], rpm=rpm, th=threshold))[0][1]
+    flat_results = list(flatten_all(results))
+    replicates1 = flat_results |> fmap$(.r1) |> set
+    replicates2 = flat_results |> fmap$(.r2) |> set
+    replicates = replicates1.union(replicates2) |> list
+    return replicates
+
+
+def get_days(prefix, rpm, threshold):
+    results = (get_data_per_replicate_no_norm([prefix], rpm=rpm, th=threshold))[0][1]
+    flat_results = list(flatten_all(results))
+    days = flat_results |> fmap$(.day) |> set |> list
+    return days
+
+
+@click.command()
+@click.option("--svg/--html", default=True)
+@click.option("--cumulative/--non-cum", default=False)
+@click.option("--log10/--linear", default=True)
+@click.option("--rpm/--raw", default=True)
+@click.option("--colorbar", default=None)
+@click.option("--threshold", default=1.01)
+@click.option("--xm", default=None)
+@click.option("--xmm", default=None)
+@click.option("--storeaddress", default=".remoter.sqlite3")
+@click.option("--show-std/--show-dens", default=False)
+@click.option("--frame-width", default=300)
+@click.option("--frame-height", default=120)
+@click.option("--averaged/--per-replicate", default=True)
+@click.option("--ko-ym", default=-3)
+@click.option("--ko-ymm", default=3)
+@click.option("--puro-ym", default=-5)
+@click.option("--puro-ymm", default=5)
+@click.argument("output")
+def main(output, svg, cumulative, log10, rpm, colorbar, threshold, xm, xmm, storeaddress, show_std, frame_width, frame_height, averaged, ko_ym, ko_ymm, puro_ym, puro_ymm):
+    print('start')
+
+    oxm, oxmm = xm, xmm
+
+    prefixes = [
+                (("KO-WT", "ko"), ("KO-WT", "wt")),
+                (("KO-PAX6", "ko"), ("KO-PAX6", "wt")),
+                (("KO-TP53", "ko"), ("KO-TP53", "wt")),
+                (("KO-ASPM", "ko"), ("KO-ASPM", "wt")),
+
+                (("KO-WT", "wt"), ("KO-WT", "ko")),
+                (("KO-WT", "wt"), ("KO-PAX6", "ko")),
+                (("KO-WT", "wt") ,("KO-TP53", "ko")),
+                (("KO-WT", "wt"), ("KO-ASPM", "ko")),
+
+                (("KO-WT", "wt"), ("KO-WT", "ko")),
+                (("KO-WT", "wt"), ("KO-PAX6", "wt")),
+                (("KO-WT", "wt"), ("KO-TP53", "wt")),
+                (("KO-WT", "wt"), ("KO-ASPM", "wt")),
+
+                (("KO-WT", "ko"), ("KO-WT", "wt")),
+                (("KO-WT", "ko"), ("KO-PAX6", "ko")),
+                ( ("KO-WT", "ko") ,("KO-TP53", "ko")),
+                (("KO-WT", "ko"), ("KO-ASPM", "ko")),
+
+                (("KO-WT", "ko"), ("KO-WT", "wt")),
+                (("KO-WT", "ko"), ("KO-PAX6", "wt")),
+                ( ("KO-WT", "ko") ,("KO-TP53", "wt")),
+                (("KO-WT", "ko"), ("KO-ASPM", "wt")),
+
+                (("PURO-3D-20-NO", "susceptible"), ("PURO-3D-20-NO", "resistant")),
+                (("PURO-3D-20-WITH", "susceptible"), ("PURO-3D-20-WITH", "resistant")),
+                (("PURO-3D-20-NO", "susceptible"), ("PURO-3D-20-WITH", "susceptible")),
+                (("PURO-3D-20-NO", "resistant"), ("PURO-3D-20-WITH", "resistant")),
+
+                (("PURO-3D-10-NO", "susceptible"), ("PURO-3D-10-NO", "resistant")),
+                (("PURO-3D-10-WITH", "susceptible"), ("PURO-3D-10-WITH", "resistant")),
+                (("PURO-3D-10-NO", "susceptible"), ("PURO-3D-10-WITH", "susceptible")),
+                (("PURO-3D-10-NO", "resistant"), ("PURO-3D-10-WITH", "resistant")),
+                ]
+
+
+    server = Scheduler(start_server=True)
+
+    with server:
+
+        xbounds = []
+        ybounds = []
+        replicates = []
+        days = []
+        for prefix in prefixes:
+            xbounds.append(server.sync_schedule(get_x_bound, prefix, rpm, threshold))
+            ybounds.append(server.sync_schedule(get_y_bound, prefix, rpm, threshold))
+            replicates.append(server.sync_schedule(get_replicates, prefix, rpm, threshold))
+            days.append(server.sync_schedule(get_days, prefix, rpm, threshold))
+
+        for tasks in [xbounds, ybounds, replicates, days]:
+            server.sync_gather(*tasks)
+
+        xbounds, ybounds, replicates, days = fmap(fmap$(.result), [xbounds, ybounds, replicates, days])
+
+        replicates = replicates |> flatten_all |> set |> list |> sorted
+        days = days |> flatten_all |> set |> list |> sorted
+
+        xm, xmm = zip(*xbounds)
+        ym, ymm = zip(*ybounds)
+        xm, xmm, ym, ymm = min(xm), max(xmm), min(ym), max(ymm)
+
+        a_ym, a_ymm = ym, ymm
+
+        a_ym, a_ymm = -max(abs(a_ym), abs(a_ymm)), max(abs(a_ym), abs(a_ymm))
+
+
+        ps = []
+
+        if log10:
+            xm, xmm = [xm, xmm] |> fmap$(np.log10)
+
+        number_of_days = (days |> fmap$(int) |> max) +1
+        day_palette = plasma(int(number_of_days))[::-1]
+        day_colors = {day: day_palette[int(day)] for day in days}
+
+        r_palette = plasma(len(replicates)+1)
+        r_colors = {r: r_palette[i] for i, r in enumerate(replicates)}
+
+
+        print('postprocessing data done')
+        if colorbar:
+            print(json.dumps(days))
+            print(json.dumps(day_colors))
+        else:
+            print('plotting started')
+
+
+
+            for prefix in tqdm(prefixes):
+                if "KO" in prefix[0][0]:
+                    if ko_ym != ko_ymm:
+                        ym, ymm = ko_ym, ko_ymm
+                    else:
+                        ym, ymm = a_ym, a_ymm
+                elif "PURO" in prefix[0][0]:
+                    if puro_ym != puro_ymm:
+                        ym, ymm = puro_ym, puro_ymm
+                    else:
+                        ym, ymm = a_ym, a_ymm
+                else:
+                    print("Neither KO nor PURO:", prefix[0])
+                #p = generate_p_dots(prefix, l, day_colors, r_colors, xm, xmm, ym, ymm, cumulative=True, log10=False)
+                #p = generate_p(prefix, l, day_colors, r_colors, xm, xmm, ym, ymm)
+                #p = generate_p_dots(prefix, l, day_colors, r_colors, xm, xmm, ym, ymm, cumulative=False, log10=False)
+                if averaged:
+                    p = server.sync_schedule(generate_p_averaged, prefix, day_colors, r_colors, xm, xmm, ym, ymm, cumulative=cumulative, log10=log10, rpm=rpm, th=threshold, show_std=show_std, dens_factor=5)
+                else:
+                    p = generate_p(prefix, day_colors, r_colors, xm, xmm, ym, ymm, rpm=rpm, th=threshold)
+                    p = Item(p)
+                ps.append(p)
+        server.sync_gather(*ps)
+        ps = [p.result for p in ps]
+
+        for p in ps:
+            if p:
+                p.frame_width = frame_width
+                p.frame_height = frame_height
+                p.title.text_font_size = "5pt"
+                p.xaxis.minor_tick_in = 0
+                p.xaxis.minor_tick_out = 0
+                p.yaxis.minor_tick_in = 0
+                p.yaxis.minor_tick_out = 0
+                p.yaxis.ticker.desired_num_ticks = int(p.y_range.end) - int(p.y_range.start) + 1 
+            if oxm:
+                p.x_range.start = float(oxm)
+            if oxmm:
+                p.x_range.end = float(oxmm)
+
+        p = grid(children=ps, ncols=4)
+
+        print('saving plot')
+        if svg:
+            syn_save(p, output, "svg")
+        else:
+            syn_save(p, output, "html")
+    print('plotting done')
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
