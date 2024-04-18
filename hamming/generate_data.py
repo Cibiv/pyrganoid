@@ -3,8 +3,8 @@ import polars as pl
 
 from rham import compute_hamming
 
-def main(data_path="../data/GSM6599035_lt48.csv", output_path="hamming_distances.csv", N=50_000):
-    df = pl.scan_csv(data_path, dtypes={"day": pl.datatypes.Utf8()})
+def main(data_path="../data/LT48.parquet", output_path="hamming_distances.csv", N=50_000):
+    df = pl.scan_parquet(data_path)
     df = df.filter(pl.col('category') == 'LT-3D').filter(pl.col('day') == '00').collect()
 
     replicates = df["replicate"].unique().sort()
