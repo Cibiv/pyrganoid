@@ -140,5 +140,14 @@ def main():
     print('Done LT47_2D')
 
 
+    # the processed LT47_3D dataset from GEO (GSE151383) does not contain the lib1/lib2 information, but can be reproduced from the raw data
+    # For convenience, the LT47_3D.parquet is commited to this git repository
+    print('Checking LT47_3D')
+    data_path = Path('LT47_3D.parquet')
+    if not data_path.exists():
+        print('{data_path} does not exist, aborting.')
+        sys.exit(-1)
+    print('Done LT47_3D')
+
 if __name__ == '__main__':
     main()
