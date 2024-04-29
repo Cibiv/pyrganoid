@@ -10,6 +10,10 @@ try:
     polars_available = True
     LT48_schema = {'sample': dt.Categorical(), 'lid': dt.Utf8(), 'nreads': dt.Int64(),
                    'category': dt.Utf8(), 'day': dt.Utf8(), 'replicate': dt.Int32(), 'effect': dt.Utf8()}
+
+    LT47_2D_schema = {'Sample': dt.Categorical(), 'LID': dt.Utf8(), 'Library': dt.Categorical(), 'nLineages': dt.Int64()}
+    LT47_2D_preprocess = [pl.col("Sample").alias("sample"), pl.col("LID").alias("lid"), pl.col("Library").alias("lib"), pl.col("nLineages").alias("nreads")]
+
 except ModuleNotFoundError:
     polars_available = False
 
@@ -73,10 +77,12 @@ def decompress(name, input_path, output_path):
                     out.write(b)
     print(f'Decompressed  {name} ({input_path})')
 
-def to_parquet(name, input_path, output_path, separator=',', schema=None):
+def to_parquet(name, input_path, output_path, separator=',', schema=None, preprocess=None):
     import polars as pl
     print(f'Converting to parquet {name} ({input_path})')
     df = pl.read_csv(input_path, separator=separator, schema=schema)
+    if preprocess:
+        df = df.select(preprocess)
     df.write_parquet(output_path)
     print(f'Converted to parquet {name} ({output_path})')
 
@@ -115,6 +121,24 @@ def main():
 
     print('Done GSM6599035')
     print()
+
+    # the processed LT47_2D dataset is unavailable from GEO, but can be reproduced from the raw data GSE151384
+    # For convenience, the LT47_2D.tsv.gz is commited to this git repository
+    print('Checking LT47_2D')
+    compressed_path = Path('LT47_2D.tsv.gz')
+    raw_path= Path('LT47_2D.tsv')
+    data_path = Path('LT47_2D.parquet')
+
+    if not data_path.exists():
+        if not raw_path.exists():
+            if not compressed_path:
+                print('LT47_2D.tsv.gz does not exist, aborting.')
+                sys.exit(-1)
+            decompress('LT47_2D', compressed_path, raw_path)
+        to_parquet('LT47_2D', raw_path, data_path, separator='\t', schema=LT47_2D_schema, preprocess=LT47_2D_preprocess)
+        raw_path.unlink()
+    print('Done LT47_2D')
+
 
 if __name__ == '__main__':
     main()

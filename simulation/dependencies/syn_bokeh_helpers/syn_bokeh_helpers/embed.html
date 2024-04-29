@@ -1,0 +1,10 @@
+<script>
+function syn_embed(j, tag) {
+fetch(j)
+.then(function(response) { return response.json() })
+.then(function(item) { document.getElementById(tag).innerHTML = ""; return Bokeh.embed.embed_item(item) })
+.then(function(item) {document.getElementById(tag).style.backgroundColor = "white";})
+.then(function(item) {document.getElementById(tag).style.position = "fixed";})
+.then(function(item) {document.getElementById(tag).style.height = "";})
+}
+</script>

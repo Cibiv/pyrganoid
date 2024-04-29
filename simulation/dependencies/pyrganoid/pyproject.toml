@@ -1,0 +1,17 @@
+[metadata]
+name = 'pyrganoid'
+version = '0.0.2'
+description = 'Organoid growth modelling library'
+author = 'Simon Haendeler'
+author_email = 'simon.emanuel.haendeler@univie.ac.at'
+license = 'MIT'
+url = 'https://github.com/Cibiv/pyrganoid'
+
+[requires]
+python_version = ['2.7', '3.5', '3.6', '3.7', 'pypy', 'pypy3']
+
+[build-system]
+requires = ['setuptools', 'wheel']
+
+[tool.hatch.commands]
+prerelease = 'hatch build'
