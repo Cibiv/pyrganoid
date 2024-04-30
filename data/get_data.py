@@ -125,27 +125,18 @@ def main():
     # the processed LT47_2D dataset is unavailable from GEO, but can be reproduced from the raw data GSE151384
     # For convenience, the LT47_2D.tsv.gz is commited to this git repository
     print('Checking LT47_2D')
-    compressed_path = Path('LT47_2D.tsv.gz')
-    raw_path= Path('LT47_2D.tsv')
     data_path = Path('LT47_2D.parquet')
-
     if not data_path.exists():
-        if not raw_path.exists():
-            if not compressed_path:
-                print('LT47_2D.tsv.gz does not exist, aborting.')
-                sys.exit(-1)
-            decompress('LT47_2D', compressed_path, raw_path)
-        to_parquet('LT47_2D', raw_path, data_path, separator='\t', schema=LT47_2D_schema, preprocess=LT47_2D_preprocess)
-        raw_path.unlink()
+        print(f'{data_path} does not exist, aborting.')
+        sys.exit(-1)
     print('Done LT47_2D')
-
 
     # the processed LT47_3D dataset from GEO (GSE151383) does not contain the lib1/lib2 information, but can be reproduced from the raw data
     # For convenience, the LT47_3D.parquet is commited to this git repository
     print('Checking LT47_3D')
     data_path = Path('LT47_3D.parquet')
     if not data_path.exists():
-        print('{data_path} does not exist, aborting.')
+        print(f'{data_path} does not exist, aborting.')
         sys.exit(-1)
     print('Done LT47_3D')
 

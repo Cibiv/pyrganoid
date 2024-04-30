@@ -4,3 +4,5 @@ This repository contains the code for the analysis for "Cerebral organoids displ
 * Lineage Tracing, lineages, distribution (violin plots) (Fig. 1e-h, SFig. 1a,b, SFig. 3b-g): `lineagetracing/`
 * Simulations (Fig. 2, SFig. 5): `simulation/`
 * Foldchange Analysis (Fig. 4e-f, Fig. 5e): `foldchange/`
+
+Before running any analysis, download the data by running the script `data/get_data.py`
