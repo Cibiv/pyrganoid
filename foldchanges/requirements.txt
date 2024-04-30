@@ -1,0 +1,10 @@
+numpy
+bokeh
+polars
+matplotlib
+scipy
+datashader
+statsmodels
+POT
+pyarrow
+tqdm

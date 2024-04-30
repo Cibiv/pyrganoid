@@ -1,3 +1,17 @@
-The algorithm to calculate the foldchanges can be found in ot/ot.py:no_kde_algorithm
+# Foldchange analysis
 
-main.coco (written in coconut, see http://coconut-lang.org/ ) was used to generate the figures, but currently depends on (uncommitted files) to get the data. The code will be adapted to work with the GEO dataset and uploaded.
+The algorithm to calculate the foldchanges can be found in synot.py:no_kde_algorithm
+
+# Installation
+
+Install all dependencies listed in `requirements.txt` as well as `remoter` and `syn_bokeh_helpers` (both found in `../simulation/dependencies/`).
+
+# Running
+
+Run the following command, which starts the orchestrator:
+
+    python main.py --threshold=0.99 --show-dens --frame-width=300 --frame-height=150 svg/all.svg
+
+Also start at least one worker via
+
+    python -m remoter.cli worker

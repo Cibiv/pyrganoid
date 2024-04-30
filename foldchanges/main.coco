@@ -1,38 +1,22 @@
 import json
-import math
-import pickle
-import sys
-import uuid
-from collections import defaultdict
 
 import click
 import numpy as np
-import remoter
-from bokeh.io import show
-from bokeh.layouts import column, grid, row
-from bokeh.models import ColumnDataSource, CustomJS, Div, Label, Panel, Tabs, TapTool
-from bokeh.palettes import Category10, Turbo256, viridis, inferno, plasma
-from bokeh.plotting import figure
-from bokeh.transform import linear_cmap
-from bokeh.document import Document
-from remoter import Server, load, save, Scheduler
-from syn_bokeh_helpers import embed_callback, rows_to_columns, syn_save
-from synot.datasources import LT48NewFormat
-from synot.helpers import violin
-from synot.ot import no_kde_algorithm, no_kde_cost, normalize_libs, plot_foldchange, plot_foldchange_no_kde, regularize, plot_foldchange_no_kde_smooth, smooth_lowess, weighted_kde, smooth_gaussian
-
-from tqdm import tqdm
-
+from bokeh.layouts import grid
+from bokeh.palettes import viridis, plasma
 from bokeh.document import Document
 import bokeh.settings
-import time
-import socket
-
 from bokeh.util.serialization import make_globally_unique_id
+from bokeh.core.json_encoder import serialize_json
+from tqdm import tqdm
 
-import config134
+from synot import no_kde_algorithm, plot_foldchange_no_kde, regularize, plot_foldchange_no_kde_smooth, smooth_lowess, weighted_kde
+from datasource import LT48
+from remoter import load, save, Scheduler
+from syn_bokeh_helpers import syn_save
 
 bokeh.settings.settings.simple_ids = False
+
 
 class Item:
     def __init__(self, a):
@@ -42,11 +26,14 @@ class Item:
 def save_plot(p):
     d = Document()
     d.add_root(p)
-    return d.to_json()
+    doc_json = d.to_json()
+    s = serialize_json(doc_json)
+    return s
+
 
 def load_plot(j):
     ids = {}
-    d = Document.from_json(j)
+    d = Document.from_json_string(j)
     p = d.roots[0]
 
     if p._id not in ids:
@@ -62,7 +49,7 @@ def load_plot(j):
     return p
 
 
-lt48 = LT48NewFormat(config134.lt48path)
+lt48 = LT48()
 lt48.load()
 
 palette = viridis(43)[::-1]
@@ -143,13 +130,16 @@ def get_for_prefix(prefix, rpm=False, th=0.99):
     #p1l1, p1l2 = get_lib_names(prefix1)
     #p2l1, p2l2 = get_lib_names(prefix2)
     lt48.rpm = rpm
-    data1 = lt48.get_data(prefix1, cells=False, replicates_seperate=True)
-    data2 = lt48.get_data(prefix2, cells=False, replicates_seperate=True)
+    data1 = lt48.get_data(prefix1)
+    data2 = lt48.get_data(prefix2)
 
     days = sorted(list(set(data1.keys())))
     r = []
 
     for day in days:
+
+        if (day not in data1) or (day not in data2):
+            continue
         color = palette[int(day)]
         replicates1 = data1[day].keys()
         replicates2 = data2[day].keys()
@@ -157,11 +147,7 @@ def get_for_prefix(prefix, rpm=False, th=0.99):
         for r1 in replicates1:
             for r2 in replicates2:
 
-                try:
-                    d1, d2 = data1[day][r1][p1l], data2[day][r2][p2l]
-                except:
-                    print(f"Error in {prefix1} R {r1} {p1l} / {prefix2} R {r2} {p2l} Day {day}")
-                    continue
+                d1, d2 = data1[day][r1][p1l], data2[day][r2][p2l]
                 if len(d1) == 0 or len(d2) == 0:
                     print(f"length is not enough, skipping {prefix1} R {r1} / {prefix2} R {r2} Day {day}")
                     continue
@@ -224,24 +210,6 @@ def generate_p(prefix, day_colors, r_colors, xm, xmm, ym, ymm, cumulative=False,
             x_axis_label=x_axis_label,
             y_axis_label="Foldchange (log2)",
             )
-
-
-        #p = plot_foldchange_no_kde_smooth(r.x,
-            #r.tx,
-            #r.dens,
-            #frame_height=150,
-            #frame_width=400,
-            #color=day_colors[r.day],
-            #p=p,
-            #title=f"{prefix2} {l2} / {prefix1} {l1}",
-            #x_range=(xm, xmm),
-            #y_range=(ym, ymm),
-            #toolbar_location=None,
-            #x_axis_label=x_axis_label,
-            #y_axis_label="Lineage Size (log2)",
-            #width=0.3,
-            #line_color=r_colors[r.r1],
-            #line=True)
 
     theme(p)
     return p
@@ -550,13 +518,13 @@ def main(output, svg, cumulative, log10, rpm, colorbar, threshold, xm, xmm, stor
         replicates = []
         days = []
         for prefix in prefixes:
-            xbounds.append(server.sync_schedule(get_x_bound, prefix, rpm, threshold))
-            ybounds.append(server.sync_schedule(get_y_bound, prefix, rpm, threshold))
-            replicates.append(server.sync_schedule(get_replicates, prefix, rpm, threshold))
-            days.append(server.sync_schedule(get_days, prefix, rpm, threshold))
+            xbounds.append(server.schedule(get_x_bound, prefix, rpm, threshold))
+            ybounds.append(server.schedule(get_y_bound, prefix, rpm, threshold))
+            replicates.append(server.schedule(get_replicates, prefix, rpm, threshold))
+            days.append(server.schedule(get_days, prefix, rpm, threshold))
 
         for tasks in [xbounds, ybounds, replicates, days]:
-            server.sync_gather(*tasks)
+            server.gather(*tasks)
 
         xbounds, ybounds, replicates, days = fmap(fmap$(.result), [xbounds, ybounds, replicates, days])
 
@@ -611,12 +579,12 @@ def main(output, svg, cumulative, log10, rpm, colorbar, threshold, xm, xmm, stor
                 #p = generate_p(prefix, l, day_colors, r_colors, xm, xmm, ym, ymm)
                 #p = generate_p_dots(prefix, l, day_colors, r_colors, xm, xmm, ym, ymm, cumulative=False, log10=False)
                 if averaged:
-                    p = server.sync_schedule(generate_p_averaged, prefix, day_colors, r_colors, xm, xmm, ym, ymm, cumulative=cumulative, log10=log10, rpm=rpm, th=threshold, show_std=show_std, dens_factor=5)
+                    p = server.schedule(generate_p_averaged, prefix, day_colors, r_colors, xm, xmm, ym, ymm, cumulative=cumulative, log10=log10, rpm=rpm, th=threshold, show_std=show_std, dens_factor=5)
                 else:
                     p = generate_p(prefix, day_colors, r_colors, xm, xmm, ym, ymm, rpm=rpm, th=threshold)
                     p = Item(p)
                 ps.append(p)
-        server.sync_gather(*ps)
+        server.gather(*ps)
         ps = [p.result for p in ps]
 
         for p in ps:
@@ -646,9 +614,3 @@ def main(output, svg, cumulative, log10, rpm, colorbar, threshold, xm, xmm, stor
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
